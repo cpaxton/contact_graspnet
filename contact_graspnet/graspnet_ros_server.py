@@ -1,3 +1,4 @@
+import rospy
 import os
 import sys
 import argparse
@@ -5,6 +6,11 @@ import numpy as np
 import time
 import glob
 import cv2
+
+import home_robot
+import home_robot_hw.ros
+from home_robot_hw.ros.grasp_helper import GraspServer
+import trimesh.transformations as tra
 
 import tensorflow.compat.v1 as tf
 tf.disable_eager_execution()
@@ -19,7 +25,22 @@ from data import regularize_pc_point_count, depth2pc, load_available_input_data
 from contact_grasp_estimator import GraspEstimator
 from visualization_utils import visualize_grasps, show_image
 
-def inference(global_config, checkpoint_dir, input_paths, K=None, local_regions=True, skip_border_objects=False, filter_grasps=True, segmap_id=None, z_range=[0.2,1.8], forward_passes=1):
+def setup_gpu():
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+      # Restrict TensorFlow to only allocate 1GB of memory on the first GPU
+      try:
+        tf.config.set_logical_device_configuration(
+            gpus[0],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=int(1024 * 3))])
+        logical_gpus = tf.config.list_logical_devices('GPU')
+        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+      except RuntimeError as e:
+        # Virtual devices must be set before GPUs have been initialized
+        print(e)
+
+
+def inference(global_config, checkpoint_dir, K=None, local_regions=True, skip_border_objects=False, filter_grasps=True, segmap_id=None, z_range=[0.2,1.8], forward_passes=1):
     """
     Predict 6-DoF grasp distribution for given model and input data
     
@@ -50,52 +71,53 @@ def inference(global_config, checkpoint_dir, input_paths, K=None, local_regions=
 
     # Load weights
     grasp_estimator.load_weights(sess, saver, checkpoint_dir, mode='test')
-    
-    os.makedirs('results', exist_ok=True)
 
-    # Process example test scenes
-    for p in glob.glob(input_paths):
-        print('Loading ', p)
-
+    def get_grasps(pc_full, pc_colors, segmap):
+        pc_segmap = segmap.reshape(-1)
         pc_segments = {}
-        segmap, rgb, depth, cam_K, pc_full, pc_colors = load_available_input_data(p, K=K)
-        
-        if segmap is None and (local_regions or filter_grasps):
-            raise ValueError('Need segmentation map to extract local regions or filter grasps')
+        for i in np.unique(pc_segmap):
+            if i == 0: continue
+            else:
+                pc_segments[i] = pc_full[pc_segmap == i]
 
-        if pc_full is None:
-            print('Converting depth to point cloud(s)...')
-            pc_full, pc_segments, pc_colors = grasp_estimator.extract_point_clouds(depth, cam_K, segmap=segmap, rgb=rgb,
-                                                                                    skip_border_objects=skip_border_objects, z_range=z_range)
-        else:
-            pc_segmap = segmap.reshape(-1)
-            for i in np.unique(pc_segmap):
-                if i == 0: continue
-                else:
-                    pc_segments[i] = pc_full[pc_segmap == i]
+        pred_grasps_cam, scores, contact_pts, _ = grasp_estimator.predict_scene_grasps(sess, pc_full,
+                                                                                       pc_segments=pc_segments, 
+                                                                                       local_regions=local_regions,
+                                                                                       filter_grasps=filter_grasps,
+                                                                                       forward_passes=forward_passes)  
+        # show_image(rgb, segmap)
+        #visualize_grasps(pc_full, pred_grasps_cam, scores, plot_opencv_cam=True, pc_colors=pc_colors)
+        # apply the correction here 
+        grasps = {}
+        for k, v in pred_grasps_cam.items():
+            fixed = np.zeros_like(v)
+            # print(k, v.shape)
+            fix = tra.euler_matrix(0, 0,  -np.pi/2)
+            for i in range(v.shape[0]):
+                fixed[i] = fix @ v[i]
+                # print(i, v[i,:3,3], fixed[i,:3, 3])
+                # pt = fix.T @ v[i, :, 3]
+                pt = fixed[i, :3, 3]
+                # print(i, scores[k][i], pt)
+                #fixed[i, :3, 3] = pt[:3]
+            grasps[k] = fixed
+        #return pred_grasps_cam, scores
+        return grasps, scores
 
-        print('Generating Grasps...')
-        pred_grasps_cam, scores, contact_pts, _ = grasp_estimator.predict_scene_grasps(sess, pc_full, pc_segments=pc_segments, 
-                                                                                          local_regions=local_regions, filter_grasps=filter_grasps, forward_passes=forward_passes)  
+    server = GraspServer(get_grasps)
+    rospy.spin()
 
-        # Save results
-        np.savez('results/predictions_{}'.format(os.path.basename(p.replace('png','npz').replace('npy','npz'))), 
-                  pred_grasps_cam=pred_grasps_cam, scores=scores, contact_pts=contact_pts)
+    rate = rospy.Rate(10)
+    while not rospy.is_shutdown():
+        if not has_input:
+            rate.sleep()
+            continue
 
-        # Visualize results          
-        print(rgb.shape)
-        show_image(rgb, segmap)
-        visualize_grasps(pc_full, pred_grasps_cam, scores, plot_opencv_cam=True, pc_colors=pc_colors)
-        
-    if not glob.glob(input_paths):
-        print('No files found: ', input_paths)
         
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt_dir', default='checkpoints/scene_test_2048_bs3_hor_sigma_001', help='Log dir [default: checkpoints/scene_test_2048_bs3_hor_sigma_001]')
-    parser.add_argument('--np_path', default='test_data/7.npy', help='Input data: npz/npy file with keys either "depth" & camera matrix "K" or just point cloud "pc" in meters. Optionally, a 2D "segmap"')
-    parser.add_argument('--png_path', default='', help='Input data: depth map png in meters')
     parser.add_argument('--K', default=None, help='Flat Camera Matrix, pass as "[fx, 0, cx, 0, fy, cy, 0, 0 ,1]"')
     parser.add_argument('--z_range', default=[0.2,1.8], help='Z value threshold to crop the input point cloud')
     parser.add_argument('--local_regions', action='store_true', default=False, help='Crop 3D local regions around given segments.')
@@ -105,13 +127,14 @@ if __name__ == "__main__":
     parser.add_argument('--segmap_id', type=int, default=0,  help='Only return grasps of the given object id')
     parser.add_argument('--arg_configs', nargs="*", type=str, default=[], help='overwrite config parameters')
     FLAGS = parser.parse_args()
-
+    rospy.init_node('contact_graspnet')
+    setup_gpu()
     global_config = config_utils.load_config(FLAGS.ckpt_dir, batch_size=FLAGS.forward_passes, arg_configs=FLAGS.arg_configs)
     
     print(str(global_config))
     print('pid: %s'%(str(os.getpid())))
 
-    inference(global_config, FLAGS.ckpt_dir, FLAGS.np_path if not FLAGS.png_path else FLAGS.png_path, z_range=eval(str(FLAGS.z_range)),
+    inference(global_config, FLAGS.ckpt_dir, z_range=eval(str(FLAGS.z_range)),
                 K=FLAGS.K, local_regions=FLAGS.local_regions, filter_grasps=FLAGS.filter_grasps, segmap_id=FLAGS.segmap_id, 
                 forward_passes=FLAGS.forward_passes, skip_border_objects=FLAGS.skip_border_objects)
 

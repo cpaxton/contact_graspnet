@@ -4,3 +4,18 @@ checkpoints/*
 **/*.pyc
 **/__pycache__
 .vscode
+
+# Data files
+*.npy
+*.pkl
+
+
+
+*.swp
+*.swn
+*.swo
+
+# Compiled things
+*.o
+*.cu.o
+*.so

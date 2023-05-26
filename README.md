@@ -125,6 +125,21 @@ python tools/create_table_top_scenes.py /path/to/acronym \
        --load_existing scene_contacts/000000.npz -vis
 ```
 
+### Running the ROS Node
+
+You need to install the ROS node and messages first. Then you can set the rest of this up.
+
+Install ROS python libraries:
+```
+conda activate contact_graspnet_env
+python -m pip install rospy rospkg
+```
+
+Now you can run the server:
+```
+python contact_graspnet/graspnet_ros_server.py
+```
+
 ## Citation
 
 ```

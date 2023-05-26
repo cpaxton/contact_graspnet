@@ -302,40 +302,52 @@ def load_available_input_data(p, K=None):
     
     segmap, rgb, depth, pc_full, pc_colors = None, None, None, None, None
 
+    cam_K = np.eye(3)
     if K is not None:
         if isinstance(K,str):
             cam_K = eval(K)
         cam_K = np.array(K).reshape(3,3)
 
     if '.np' in p:
-        data = np.load(p, allow_pickle=True)
+        data = np.load(p, allow_pickle=True, encoding="bytes")
         if '.npz' in p:
             keys = data.files
         else:
             keys = []
             if len(data.shape) == 0:
                 data = data.item()
-                keys = data.keys()
+                old_data = data
+                keys = []
+                data = {}
+                for k, v in old_data.items():
+                    if isinstance(k, bytes):
+                        key = k.decode('utf-8')
+                    elif isinstance(k, str):
+                        key = k
+                    else:
+                        raise RuntimeError('type doesnt make sense: ' + str(type(k)))
+                    keys.append(key)
+                    data[key] = v
             elif data.shape[-1] == 3:
                 pc_full = data
             else:
                 depth = data
-
         if 'depth' in keys:
             depth = data['depth']
-            if K is None and 'K' in keys:
-                cam_K = data['K'].reshape(3,3)
-            if 'segmap' in keys:    
-                segmap = data['segmap']
-            if 'seg' in keys:    
-                segmap = data['seg']
-            if 'rgb' in keys:    
-                rgb = data['rgb']
-                rgb = np.array(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
-        elif 'xyz' in keys:
+        if K is None and 'K' in keys:
+            cam_K = data['K'].reshape(3,3)
+        if 'segmap' in keys:    
+            segmap = data['segmap']
+        if 'seg' in keys:    
+            segmap = data['seg']
+        if 'rgb' in keys:    
+            rgb = data['rgb'].astype(np.uint8)
+            rgb = np.array(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
+        # Load xyz if both it and depth exist
+        if 'xyz' in keys:
             pc_full = np.array(data['xyz']).reshape(-1,3)
             if 'xyz_color' in keys:
-                pc_colors = data['xyz_color']
+                pc_colors = data['xyz_color'].reshape(-1, 3)
     elif '.png' in p:
         if os.path.exists(p.replace('depth', 'label')):
             # graspnet data
